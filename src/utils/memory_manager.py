@@ -44,40 +44,17 @@ class MemoryManager:
                 MemoryManager.force_garbage_collection()
         return wrapper
 
-def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 200) -> list:
-    """Split text into overlapping chunks for processing"""
-    if len(text) <= chunk_size:
-        return [text]
-    
+def chunk_text(text, chunk_size=300, overlap=50):
+    words = text.split()
     chunks = []
     start = 0
-    
-    while start < len(text):
+    while start < len(words):
         end = start + chunk_size
-        
-        # If this is not the last chunk, try to break at a sentence or word boundary
-        if end < len(text):
-            # Look for sentence boundary
-            sentence_end = text.rfind('.', start, end)
-            if sentence_end > start + chunk_size // 2:
-                end = sentence_end + 1
-            else:
-                # Look for word boundary
-                word_end = text.rfind(' ', start, end)
-                if word_end > start + chunk_size // 2:
-                    end = word_end
-        
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        
-        # Move start position with overlap
-        start = max(start + 1, end - overlap)
-        
-        if start >= len(text):
-            break
-    
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        start += chunk_size - overlap
     return chunks
+
 
 class StreamingProcessor:
     """Process data in streaming fashion to minimize memory usage"""
