@@ -10,6 +10,10 @@ import pypdf
 import google.generativeai as genai
 from src.utils.memory_manager import MemoryManager, chunk_text, StreamingProcessor
 from src.training.enhanced_model import EnhancedQueryProcessor
+from src.training.optimized_query_processor import OptimizedQueryProcessor
+from src.utils.intelligent_cache import get_document_cache, get_query_cache, get_embedding_cache
+from src.training.scoring_optimizer import HackRXScoringOptimizer
+import hashlib
 
 # Import OCR libraries for image-based PDFs
 try:
@@ -347,26 +351,45 @@ class EnhancedPDFProcessor:
         
         return text
 
-# Initialize enhanced processor with training data
-training_data_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "training_data", "raw_dataset.json")
-enhanced_processor = None
+# Initialize optimized processor with training data and scoring optimizer
+training_data_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "src", "training", "processed_training_data.json")
+optimized_processor = None
+scoring_optimizer = None
 
 try:
     if os.path.exists(training_data_path):
-        enhanced_processor = EnhancedQueryProcessor(training_data_path)
-        print("✅ Enhanced processor initialized with training data")
+        optimized_processor = OptimizedQueryProcessor(training_data_path)
+        scoring_optimizer = HackRXScoringOptimizer(optimized_processor)
+        print("✅ Optimized processor and scoring optimizer initialized with training data and FAISS indexing")
     else:
-        enhanced_processor = EnhancedQueryProcessor()
-        print("⚠️ Enhanced processor initialized without training data")
+        optimized_processor = OptimizedQueryProcessor()
+        scoring_optimizer = HackRXScoringOptimizer(optimized_processor)
+        print("⚠️ Optimized processor and scoring optimizer initialized without training data")
 except Exception as e:
-    print(f"⚠️ Error initializing enhanced processor: {str(e)}")
-    enhanced_processor = EnhancedQueryProcessor()
+    print(f"⚠️ Error initializing optimized processor: {str(e)}")
+    # Fallback to enhanced processor
+    try:
+        if os.path.exists(training_data_path):
+            optimized_processor = EnhancedQueryProcessor(training_data_path)
+            print("✅ Fallback: Enhanced processor initialized")
+        else:
+            optimized_processor = EnhancedQueryProcessor()
+            print("⚠️ Fallback: Enhanced processor initialized without training data")
+        scoring_optimizer = None  # No scoring optimizer available
+    except Exception as e2:
+        print(f"⚠️ Error initializing fallback processor: {str(e2)}")
+        optimized_processor = EnhancedQueryProcessor()
+        scoring_optimizer = None
 
 @hackrx_unified_bp.route('/run', methods=['POST'])
 @cross_origin()
 def hackrx_unified_run():
-    """Unified HackRX API endpoint with enhanced error handling and PDF processing"""
+    """Unified HackRX API endpoint with enhanced error handling, caching, and PDF processing"""
     memory_manager = MemoryManager()
+    
+    # Initialize caches
+    document_cache = get_document_cache()
+    query_cache = get_query_cache()
     
     try:
         # Log initial memory usage
@@ -442,42 +465,62 @@ def hackrx_unified_run():
                     'details': f'Maximum 2000 characters allowed, question has {len(question)}'
                 }), 400
         
-        # Process PDF with enhanced error handling
+        # Generate document hash for caching
+        document_hash = hashlib.sha256(documents_url.encode()).hexdigest()[:16]
+        
+        # Check for cached batch results first
+        cached_answers = query_cache.get_batch_results(document_hash, questions)
+        if cached_answers:
+            print("✅ Returning cached batch results")
+            return jsonify({'answers': cached_answers}), 200
+        
+        # Process PDF with enhanced error handling and caching
         try:
-            print("Starting enhanced PDF processing...")
-            pdf_processor = EnhancedPDFProcessor()
+            print("Starting enhanced PDF processing with caching...")
             
-            # Download PDF
-            try:
-                pdf_bytes = pdf_processor.download_pdf(documents_url)
-            except Exception as e:
-                return jsonify({
-                    'error': 'PDF download failed',
-                    'details': str(e),
-                    'url': documents_url
-                }), 400
+            # Check for cached document text
+            document_text = document_cache.get_document_text(documents_url)
             
-            # Check memory after download
-            memory_after_download = memory_manager.get_memory_usage()
-            print(f"Memory after PDF download: {memory_after_download['rss_mb']:.2f}MB")
-            
-            # Extract text
-            try:
-                document_text = pdf_processor.extract_text_from_pdf(pdf_bytes)
-            except Exception as e:
-                return jsonify({
-                    'error': 'PDF text extraction failed',
-                    'details': str(e),
-                    'suggestions': [
-                        'Ensure the PDF is not password-protected',
-                        'Check if the PDF contains readable text (not just images)',
-                        'Try a different PDF file'
-                    ]
-                }), 400
-            
-            # Clear PDF bytes from memory immediately
-            del pdf_bytes
-            gc.collect()
+            if document_text:
+                print("✅ Using cached document text")
+            else:
+                print("📥 Processing document from URL...")
+                pdf_processor = EnhancedPDFProcessor()
+                
+                # Download PDF
+                try:
+                    pdf_bytes = pdf_processor.download_pdf(documents_url)
+                except Exception as e:
+                    return jsonify({
+                        'error': 'PDF download failed',
+                        'details': str(e),
+                        'url': documents_url
+                    }), 400
+                
+                # Check memory after download
+                memory_after_download = memory_manager.get_memory_usage()
+                print(f"Memory after PDF download: {memory_after_download['rss_mb']:.2f}MB")
+                
+                # Extract text
+                try:
+                    document_text = pdf_processor.extract_text_from_pdf(pdf_bytes)
+                except Exception as e:
+                    return jsonify({
+                        'error': 'PDF text extraction failed',
+                        'details': str(e),
+                        'suggestions': [
+                            'Ensure the PDF is not password-protected',
+                            'Check if the PDF contains readable text (not just images)',
+                            'Try a different PDF file'
+                        ]
+                    }), 400
+                
+                # Clear PDF bytes from memory immediately
+                del pdf_bytes
+                gc.collect()
+                
+                # Cache the document text
+                document_cache.set_document_text(documents_url, document_text, ttl=7200)  # 2 hours
             
             print(f"Extracted text length: {len(document_text)} characters")
             
@@ -499,23 +542,93 @@ def hackrx_unified_run():
                 'details': str(e)
             }), 400
         
-        # Process queries with enhanced model
+        # Process queries with scoring-optimized processor and caching
         try:
-            print("Starting enhanced query processing...")
+            print("Starting HackRX scoring-optimized query processing...")
             
-            if enhanced_processor and enhanced_processor.model:
-                answers = enhanced_processor.batch_process_queries(document_text, questions)
-            else:
-                return jsonify({
-                    'error': 'Query processor not available',
-                    'details': 'Enhanced processor or Gemini API not properly configured'
-                }), 500
+            # Check for individual cached answers first
+            cached_individual = []
+            uncached_questions = []
+            uncached_indices = []
+            
+            for i, question in enumerate(questions):
+                cached_answer = query_cache.get_query_result(document_hash, question)
+                if cached_answer:
+                    cached_individual.append((i, cached_answer))
+                else:
+                    uncached_questions.append(question)
+                    uncached_indices.append(i)
+            
+            print(f"Found {len(cached_individual)} cached answers, processing {len(uncached_questions)} new questions")
+            
+            # Process uncached questions with scoring optimization
+            new_answers = []
+            if uncached_questions:
+                if scoring_optimizer:
+                    # Use HackRX scoring optimizer for maximum performance
+                    print("🎯 Using HackRX Scoring Optimizer for maximum accuracy on unknown documents")
+                    new_answers = scoring_optimizer.process_with_scoring_optimization(document_text, uncached_questions)
+                    
+                    # Get scoring analysis
+                    try:
+                        scoring_analysis = scoring_optimizer.get_scoring_analysis(document_text, uncached_questions, new_answers)
+                        print(f"📊 Scoring Analysis: {scoring_analysis['document_type']} document, "
+                              f"efficiency: {scoring_analysis['score_efficiency']:.1%}, "
+                              f"high priority: {scoring_analysis['high_priority_questions']}")
+                    except Exception as e:
+                        print(f"Warning: Scoring analysis failed: {str(e)}")
+                
+                elif optimized_processor:
+                    # Fallback to standard optimized processing
+                    print("⚡ Using standard optimized processing")
+                    if hasattr(optimized_processor, 'batch_process_queries'):
+                        new_answers = optimized_processor.batch_process_queries(document_text, uncached_questions)
+                    else:
+                        # Individual processing fallback
+                        new_answers = []
+                        for question in uncached_questions:
+                            try:
+                                if hasattr(optimized_processor, 'process_query_optimized'):
+                                    result = optimized_processor.process_query_optimized(document_text, question)
+                                    answer = result.answer if hasattr(result, 'answer') else result
+                                else:
+                                    answer = optimized_processor.process_query_hybrid(document_text, question)
+                                new_answers.append(answer)
+                            except Exception as e:
+                                print(f"Error processing individual question: {str(e)}")
+                                new_answers.append(f"Error processing question: {str(e)}")
+                else:
+                    return jsonify({
+                        'error': 'Query processor not available',
+                        'details': 'Neither optimized processor nor scoring optimizer available'
+                    }), 500
+                
+                # Cache new answers
+                for question, answer in zip(uncached_questions, new_answers):
+                    query_cache.set_query_result(document_hash, question, answer, ttl=3600)  # 1 hour
+            
+            # Combine cached and new answers in correct order
+            final_answers = [''] * len(questions)
+            
+            # Place cached answers
+            for i, answer in cached_individual:
+                final_answers[i] = answer
+            
+            # Place new answers
+            for idx, answer in zip(uncached_indices, new_answers):
+                final_answers[idx] = answer
+            
+            answers = final_answers
+            
+            # Cache batch results for future requests
+            if answers:
+                query_cache.set_batch_results(document_hash, questions, answers, ttl=3600)
             
             # Clear document text from memory
             del document_text
             gc.collect()
             
-            print("Enhanced query processing completed")
+            print("HackRX scoring-optimized processing completed successfully")
             
         except Exception as e:
             return jsonify({
@@ -533,6 +646,10 @@ def hackrx_unified_run():
         # Final memory check
         final_memory = memory_manager.get_memory_usage()
         print(f"Final memory usage: {final_memory['rss_mb']:.2f}MB")
+        
+        # Log cache statistics
+        cache_stats = query_cache.cache.get_stats()
+        print(f"Cache hit rate: {cache_stats['overall_hit_rate']:.2%}")
         
         return jsonify({
             'answers': answers
@@ -564,7 +681,7 @@ def hackrx_unified_run():
 @hackrx_unified_bp.route('/health', methods=['GET'])
 @cross_origin()
 def health_check_unified():
-    """Enhanced health check endpoint"""
+    """Enhanced health check endpoint with cache statistics"""
     memory_manager = MemoryManager()
     memory_usage = memory_manager.get_memory_usage()
     
@@ -574,24 +691,38 @@ def health_check_unified():
     # Check OCR availability
     ocr_status = "available" if OCR_AVAILABLE else "unavailable"
     
+    # Get cache statistics
+    try:
+        cache_stats = get_query_cache().cache.get_stats()
+    except:
+        cache_stats = {"error": "Cache not available"}
+    
     return jsonify({
         'status': 'healthy',
         'service': 'HackRX Unified API',
-        'version': '3.1.0',
+        'version': '4.0.0',  # Updated version
         'model': 'gemini-1.5-pro-latest',
         'memory_usage_mb': round(memory_usage['rss_mb'], 2),
         'memory_percent': round(memory_usage['percent'], 2),
         'api_key_status': api_key_status,
         'ocr_status': ocr_status,
+        'cache_stats': cache_stats,
         'enhanced_features': [
+            'HackRX Scoring Optimization',
+            'FAISS semantic search',
+            'Multi-layer intelligent caching',
             'OCR support for image-based PDFs',
             'Enhanced error handling',
             'Improved text extraction',
             'Memory optimization',
             'Document similarity matching',
-            'Training data integration'
+            'Training data integration',
+            'Domain-aware processing',
+            'Unknown document prioritization',
+            'Question complexity analysis'
         ],
-        'training_documents': len(enhanced_processor.training_data) if enhanced_processor else 0
+        'scoring_optimizer_available': scoring_optimizer is not None,
+        'training_documents': len(optimized_processor.training_data) if optimized_processor else 0
     }), 200
 
 @hackrx_unified_bp.route('/test', methods=['POST'])
